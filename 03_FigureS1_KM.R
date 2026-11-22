@@ -1,0 +1,65 @@
+#!/usr/bin/env Rscript
+suppressPackageStartupMessages({library(survival);library(ggplot2);library(patchwork);library(cowplot)})
+args <- commandArgs(FALSE)
+script <- normalizePath(gsub('~+~', ' ', sub('^--file=', '', grep('^--file=', args, value=TRUE)), fixed=TRUE))
+root <- dirname(script)
+input <- Sys.getenv('VALERIC_DATA_DIR', file.path(root, 'data', 'private'))
+input <- normalizePath(input, mustWork=TRUE)
+out <- file.path(root, 'outputs', 'figureS1')
+dir.create(out, recursive=TRUE, showWarnings=FALSE)
+reference <- file.path(root, 'outputs', 'tables', 'Supplementary_Table_S2_KM_median_stratified_SCFA.csv')
+m <- read.csv(file.path(input,'metadata.csv'),check.names=FALSE)
+s <- read.csv(file.path(input,'SCFA_log2.csv'),check.names=FALSE)
+stopifnot(!anyDuplicated(m$ResearchID),!anyDuplicated(s$ResearchID),setequal(m$ResearchID,s$ResearchID))
+d <- merge(m,s,by='ResearchID',sort=FALSE)
+ref <- read.csv(reference,check.names=FALSE)
+features <- c('Acetic_acid','Propionic_acid','Butyric_acid','Isobutyric_acid','Isovaleric_acid','X2.Methylbutyric_acid')
+outcomes <- c('therapy_intensification','medication_intensification','intensive_escalation')
+labels <- c('Overall therapy intensification','Medication intensification','Intensive escalation')
+times <- c('time_to_therapy_intensification','time_to_medication_intensification','time_to_intensive_escalation_m')
+events <- paste0('event_',outcomes)
+cols <- c(Low='#72BDF8',High='#59249E')
+breaks <- seq(0,60,12)
+plots <- list(); stats <- list(); risks <- list()
+fmtp <- function(p) if(p<.001) formatC(p,format='g',digits=2) else formatC(p,format='f',digits=if(p<.01)4 else 3)
+for(i in seq_along(outcomes))for(feature in features){
+ x <- data.frame(time=d[[times[i]]],event=d[[events[i]]],value=d[[feature]])
+ x <- x[complete.cases(x),]
+ threshold <- median(x$value)
+ x$group <- factor(ifelse(x$value>=threshold,'High','Low'),levels=c('Low','High'))
+ stopifnot(nrow(x)==380,all(x$event %in% 0:1),all(x$time>=0),max(x$time)<61)
+ fit <- survfit(Surv(time,event)~group,data=x)
+ cx <- summary(coxph(Surv(time,event)~group,data=x,ties='efron'))
+ lr <- survdiff(Surv(time,event)~group,data=x)
+ lp <- pchisq(lr$chisq,1,lower.tail=FALSE)
+ st <- data.frame(outcome=outcomes[i],feature=feature,median_log2=threshold,n=nrow(x),events=sum(x$event),n_low=sum(x$group=='Low'),n_high=sum(x$group=='High'),events_low=sum(x$event[x$group=='Low']),events_high=sum(x$event[x$group=='High']),HR=cx$conf.int[1,1],CI_low=cx$conf.int[1,3],CI_high=cx$conf.int[1,4],Cox_p_value=cx$coefficients[1,5],logrank_p_value=lp)
+ rr <- ref[ref$outcome==outcomes[i]&ref$feature==feature,]
+ stopifnot(nrow(rr)==1)
+ for(k in c('HR','CI_low','CI_high','Cox_p_value','logrank_p_value','n_low','n_high','events_low','events_high'))stopifnot(abs(st[[k]]-rr[[k]])<1e-9)
+ stats[[length(stats)+1]]<-st
+ ss <- summary(fit,censored=TRUE)
+ curve <- data.frame(time=ss$time,probability=1-ss$surv,group=sub('group=','',as.character(ss$strata)),censored=ss$n.censor)
+ curve <- rbind(data.frame(time=0,probability=0,group=c('Low','High'),censored=0),curve)
+ curve$group<-factor(curve$group,levels=c('Low','High'))
+ curve<-curve[order(curve$group,curve$time),]
+ # Raw time variables are retained exactly. Administrative censoring occurs
+ # near 60 months (some values just below 60); the final table column evaluates 59.9 months.
+ risk<-expand.grid(time=breaks,group=c('Low','High'),stringsAsFactors=FALSE)
+ risk$evaluation_month <- ifelse(risk$time==60,59.9,risk$time)
+ risk$n_risk<-mapply(function(t,g)sum(x$group==g & x$time>=t),risk$evaluation_month,risk$group)
+ risk$cumulative_events<-mapply(function(t,g)sum(x$group==g & x$time<=t & x$event==1),risk$evaluation_month,risk$group)
+ risk$outcome<-outcomes[i];risk$feature<-feature
+ risks[[length(risks)+1]]<-risk
+ ymax<-if(i==3).26 else .40
+ annotation<-sprintf('HR %.2f (95%% CI %.2f-%.2f)\nCox P = %s; log-rank P = %s\nEvents: Low %d/%d; High %d/%d',st$HR,st$CI_low,st$CI_high,fmtp(st$Cox_p_value),fmtp(lp),st$events_low,st$n_low,st$events_high,st$n_high)
+ p<-ggplot(curve,aes(time,probability,color=group))+geom_step(linewidth=.65)+geom_point(data=curve[curve$censored>0,],shape=3,size=1.8,stroke=.5)+annotate('text',x=1,y=ymax*.98,label=annotation,hjust=0,vjust=1,size=2.45,lineheight=1.15,color='black')+scale_color_manual(values=cols,breaks=c('Low','High'),drop=FALSE)+scale_x_continuous(limits=c(-3,63),breaks=breaks,expand=c(0,0))+scale_y_continuous(limits=c(0,ymax),breaks=if(i==3)seq(0,.2,.05) else seq(0,.4,.1),expand=c(0,0))+labs(title=if(feature=='X2.Methylbutyric_acid')'2-Methylbutyric acid' else gsub('_',' ',feature),subtitle=labels[i],x=NULL,y=NULL,color=NULL)+theme_classic(base_size=9)+theme(plot.title=element_text(face='bold',size=10),plot.subtitle=element_text(face='bold',size=8),legend.position='none',plot.margin=margin(5,10,0,5),axis.text=element_text(color='black'))
+ risk_labels <- c('0','12','24','36','48','60*')
+ t<-ggplot(risk,aes(time,factor(group,levels=c('High','Low')),label=n_risk,color=group))+geom_text(size=2.6)+scale_color_manual(values=cols)+scale_x_continuous(limits=c(-3,63),breaks=breaks,labels=risk_labels,expand=c(0,0))+labs(title='Number at risk',x=NULL,y=NULL)+theme_classic(base_size=8)+theme(legend.position='none',axis.line=element_blank(),axis.ticks=element_blank(),axis.text.x=element_text(color='black',size=7),axis.text.y=element_text(color='black'),plot.title=element_text(size=8),plot.margin=margin(0,10,3,5))
+ plots[[length(plots)+1]]<-(p/t)+plot_layout(heights=c(4,1))
+}
+combined<-wrap_plots(plots,ncol=6)
+fig<-ggdraw()+draw_plot(combined,x=.027,y=.04,width=.97,height=.955)+draw_label('Cumulative probability',x=.009,y=.53,angle=90,size=12)+draw_label('Time since faecal sampling (months)',x=.53,y=.016,size=12)
+ggsave(file.path(out,'FigureS1_with_risk_tables.pdf'),fig,width=21,height=12.5,device="pdf",bg='white')
+ggsave(file.path(out,'FigureS1_with_risk_tables.png'),fig,width=21,height=12.5,dpi=220,bg='white')
+write.csv(do.call(rbind,stats),file.path(out,'reproduced_statistics.csv'),row.names=FALSE)
+write.csv(do.call(rbind,risks),file.path(out,'risk_counts_and_cumulative_events.csv'),row.names=FALSE)
